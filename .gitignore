@@ -1,0 +1,22 @@
+# Secrets -- never commit these
+.env
+*.pem
+.bashrc
+credentials.json
+config.json
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
