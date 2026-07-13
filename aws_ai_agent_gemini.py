@@ -10,7 +10,7 @@ DevOps (CloudWatch/CodeBuild/CodePipeline/CloudFormation), Analytics
 Uses Google's free-tier Gemini API instead of OpenAI/Anthropic.
 
 Setup:
-    pip install boto3 google-generativeai
+    pip install boto3 google-genai
     aws configure
     export GEMINI_API_KEY="your-key"
 
@@ -24,7 +24,7 @@ import zipfile
 import io
 import os
 import boto3
-import google.generativeai as genai
+from google import genai
 
 REGION = "ap-south-1"
 
@@ -70,7 +70,7 @@ kinesis = boto3.client("kinesis", region_name=REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
 sagemaker = boto3.client("sagemaker", region_name=REGION)
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 # =====================================================================
 # NETWORKING
@@ -1013,12 +1013,13 @@ def _normalize_gemini_args(value):
 
 
 def run_agent():
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=SYSTEM_PROMPT,
-        tools=GEMINI_TOOLS,
+    chat = client.chats.create(
+        model=MODEL_NAME,
+        config={
+            "system_instruction": SYSTEM_PROMPT,
+            "tools": GEMINI_TOOLS,
+        },
     )
-    chat = model.start_chat(history=[])
     print(f"AWS AI Agent (Gemini/{MODEL_NAME}) ready. Type your requirement (or 'quit' to exit).\n")
 
     while True:
@@ -1032,7 +1033,7 @@ def run_agent():
             function_calls = []
             text_parts = []
 
-            for part in response.candidates[0].content.parts:
+            for part in response.content.parts:
                 if hasattr(part, "function_call") and part.function_call and part.function_call.name:
                     function_calls.append(part.function_call)
                 elif hasattr(part, "text") and part.text:
@@ -1057,12 +1058,12 @@ def run_agent():
                 print(f"[Result] {result}\n")
 
                 function_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=fn_name,
-                            response={"result": json.dumps(result)},
-                        )
-                    )
+                    {
+                        "function_response": {
+                            "name": fn_name,
+                            "response": {"result": json.dumps(result)},
+                        }
+                    }
                 )
 
             response = chat.send_message(function_response_parts)

@@ -1,4 +1,4 @@
 boto3
-google-generativeai
+google-genai
 openai
 python-dotenv
