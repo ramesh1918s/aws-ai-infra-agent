@@ -7,10 +7,12 @@ Messaging (SNS/SQS/EventBridge/API Gateway/Step Functions), Monitoring/
 DevOps (CloudWatch/CodeBuild/CodePipeline/CloudFormation), Analytics
 (Glue/Athena/Kinesis), AI/ML (Bedrock/SageMaker).
 
-Uses Google's free-tier Gemini API instead of OpenAI/Anthropic.
+Uses Google's free-tier Gemini API instead of OpenAI/Anthropic, via the
+current `google-genai` SDK (the old `google-generativeai` package is
+deprecated and no longer receives updates or bug fixes).
 
 Setup:
-    pip install boto3 google-generativeai
+    pip install boto3 google-genai
     aws configure
     export GEMINI_API_KEY="your-key"
 
@@ -25,7 +27,9 @@ import zipfile
 import io
 import os
 import boto3
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from google.genai import errors as genai_errors
 
 REGION = "ap-south-1"
 
@@ -71,7 +75,7 @@ kinesis = boto3.client("kinesis", region_name=REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
 sagemaker = boto3.client("sagemaker", region_name=REGION)
 
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 # =====================================================================
 # NETWORKING
@@ -1274,10 +1278,9 @@ TOOLS = [
 
 
 def _clean_schema_for_gemini(schema):
-    """Gemini's OpenAPI-subset schema doesn't like empty enum/extra keys in
-    every case, but plain type/properties/required/items/enum/description
-    works fine. This mostly passes the schema through, dropping properties
-    with no 'type' declared (Gemini requires a type on every property)."""
+    """Gemini's schema handling doesn't like every possible JSON Schema
+    permutation -- this mostly passes the schema through, but ensures every
+    property declares a 'type' (some models reject untyped properties)."""
     if not isinstance(schema, dict):
         return schema
     cleaned = {}
@@ -1299,17 +1302,21 @@ def _clean_schema_for_gemini(schema):
 
 def to_gemini_tools(tools):
     """Convert Anthropic-style tool schemas (name/description/input_schema)
-    into Gemini's function_declarations format."""
+    into a single google-genai types.Tool holding one FunctionDeclaration
+    per tool. Uses parameters_json_schema so the JSON Schema dicts can be
+    passed straight through instead of hand-building types.Schema objects."""
     declarations = []
     for t in tools:
         params = _clean_schema_for_gemini(dict(t["input_schema"]))
         params.setdefault("properties", {})
-        declarations.append({
-            "name": t["name"],
-            "description": t["description"],
-            "parameters": params,
-        })
-    return [{"function_declarations": declarations}]
+        declarations.append(
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters_json_schema=params,
+            )
+        )
+    return [types.Tool(function_declarations=declarations)]
 
 
 GEMINI_TOOLS = to_gemini_tools(TOOLS)
@@ -1389,26 +1396,31 @@ These are DESTRUCTIVE and IRREVERSIBLE. Before calling any delete/terminate tool
      looks related."""
 
 
-MODEL_NAME = "gemini-2.5-flash-lite"
-# Free-tier daily quotas vary a LOT by model and even by account -- as observed:
-#   gemini-flash-latest (-> gemini-3.5-flash as of writing): as low as 20 requests/DAY on some
-#     accounts -- unusable for a multi-step agent (a single VPC+EC2 plan can burn 15-20 calls)
-#   gemini-2.5-flash-lite: typically ~1000 requests/day, 15-30 RPM -- much better fit here
-# If you still hit daily quota errors, check your project's live limits in AI Studio:
-# https://aistudio.google.com/ -> your project -> Rate limits. Numbers Google publishes in
-# docs are frequently not what a given free-tier project actually gets.
+MODEL_NAME = "gemini-3.1-flash-lite"
+# The whole Gemini 2.x line (2.0 Flash, 2.0 Flash-Lite, 2.5 Flash-Lite, etc.) has been
+# retired or is being retired through 2026 -- a 404 "no longer available" on one of
+# those model strings means exactly that, not a typo in your code. Current
+# cost-efficient options as of mid-2026:
+#   gemini-3.1-flash-lite : cheapest/fastest, the closest current equivalent of the
+#                            old 2.5-flash-lite -- good default for a tool-heavy agent
+#   gemini-3.5-flash      : more capable, still flash-tier pricing, but has been
+#                            observed with much tighter free-tier daily quotas on some
+#                            accounts (as low as 20 requests/day) -- a single VPC+EC2
+#                            plan can burn 15-20 calls and exhaust that in one session
+# Free-tier daily quotas vary a LOT by model and even by account. If you hit daily
+# quota errors, check your project's live limits in AI Studio: https://aistudio.google.com/
+# -> your project -> Rate limits. Numbers Google publishes in docs are frequently not
+# what a given free-tier project actually gets.
 
 
 def _normalize_gemini_args(value):
-    """Gemini's function-calling proto returns all numbers as floats (e.g.
-    port 22 arrives as 22.0), but boto3 strictly rejects float where it
+    """Gemini's function-calling response can return whole numbers as floats
+    (e.g. port 22 arrives as 22.0), but boto3 strictly rejects float where it
     expects int (FromPort, ToPort, storage sizes, counts, etc). This
-    recursively walks dicts/lists/MapComposite/RepeatedComposite objects
-    and downcasts whole-number floats to int."""
-    # proto-plus MapComposite / RepeatedComposite behave like dict / list
-    if hasattr(value, "items"):
+    recursively walks dicts/lists and downcasts whole-number floats to int."""
+    if isinstance(value, dict):
         return {k: _normalize_gemini_args(v) for k, v in value.items()}
-    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+    if isinstance(value, (list, tuple)):
         return [_normalize_gemini_args(v) for v in value]
     if isinstance(value, float) and value.is_integer():
         return int(value)
@@ -1423,16 +1435,18 @@ class DailyQuotaExhausted(Exception):
 
 
 def _send_with_retry(chat, content, max_retries=5):
-    """Gemini's free tier enforces both a per-minute limit (RPM) and a
-    per-day limit (RPD). RPM hits are transient -- wait and retry. RPD
-    hits mean the daily allowance for this model is gone; retrying in a
-    loop just wastes time, so we surface that clearly instead."""
-    from google.api_core.exceptions import ResourceExhausted
-
+    """The current google-genai SDK raises google.genai.errors.ClientError
+    for 4xx responses, including 429 rate/quota limits. Free tier enforces
+    both a per-minute limit (RPM -- transient, worth a short wait-and-retry)
+    and a per-day limit (RPD -- only fixed by waiting for the daily reset,
+    switching models, or enabling billing); we tell them apart from the
+    error body since both surface as HTTP 429."""
     for attempt in range(max_retries):
         try:
             return chat.send_message(content)
-        except ResourceExhausted as e:
+        except genai_errors.ClientError as e:
+            if getattr(e, "code", None) != 429:
+                raise
             err_text = str(e)
             is_daily = "PerDay" in err_text or "RequestsPerDay" in err_text
 
@@ -1450,7 +1464,7 @@ def _send_with_retry(chat, content, max_retries=5):
                 ) from e
 
             wait_s = 15
-            match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", err_text)
+            match = re.search(r'retryDelay["\']?\s*:\s*["\']?(\d+)s', err_text)
             if match:
                 wait_s = int(match.group(1)) + 1
             print(f"[Rate limited by Gemini free tier (per-minute) -- waiting {wait_s}s before "
@@ -1461,12 +1475,13 @@ def _send_with_retry(chat, content, max_retries=5):
 
 
 def run_agent():
-    model = genai.GenerativeModel(
-        model_name=MODEL_NAME,
-        system_instruction=SYSTEM_PROMPT,
-        tools=GEMINI_TOOLS,
+    chat = client.chats.create(
+        model=MODEL_NAME,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=GEMINI_TOOLS,
+        ),
     )
-    chat = model.start_chat(history=[])
     print(f"AWS AI Agent (Gemini/{MODEL_NAME}) ready. Type your requirement (or 'quit' to exit).\n")
     print("Note: free tier has both a per-minute limit (auto-retried below) and a per-day\n"
           "limit (resets at midnight Pacific Time -- if hit, you'll see a [STOPPED] message).\n")
@@ -1484,9 +1499,9 @@ def run_agent():
                 text_parts = []
 
                 for part in response.candidates[0].content.parts:
-                    if hasattr(part, "function_call") and part.function_call and part.function_call.name:
+                    if getattr(part, "function_call", None) and part.function_call.name:
                         function_calls.append(part.function_call)
-                    elif hasattr(part, "text") and part.text:
+                    elif getattr(part, "text", None):
                         text_parts.append(part.text)
 
                 if text_parts:
@@ -1508,11 +1523,9 @@ def run_agent():
                     print(f"[Result] {result}\n")
 
                     function_response_parts.append(
-                        genai.protos.Part(
-                            function_response=genai.protos.FunctionResponse(
-                                name=fn_name,
-                                response={"result": json.dumps(result)},
-                            )
+                        types.Part.from_function_response(
+                            name=fn_name,
+                            response={"result": json.dumps(result)},
                         )
                     )
 
