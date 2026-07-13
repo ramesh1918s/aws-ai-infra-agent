@@ -10,7 +10,7 @@ DevOps (CloudWatch/CodeBuild/CodePipeline/CloudFormation), Analytics
 Uses Google's free-tier Gemini API instead of OpenAI/Anthropic.
 
 Setup:
-    pip install boto3 google-genai
+    pip install boto3 google-generativeai
     aws configure
     export GEMINI_API_KEY="your-key"
 
@@ -20,11 +20,12 @@ Run:
 
 import json
 import time
+import re
 import zipfile
 import io
 import os
 import boto3
-from google import genai
+import google.generativeai as genai
 
 REGION = "ap-south-1"
 
@@ -70,7 +71,7 @@ kinesis = boto3.client("kinesis", region_name=REGION)
 bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
 sagemaker = boto3.client("sagemaker", region_name=REGION)
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
 # =====================================================================
 # NETWORKING
@@ -145,8 +146,70 @@ def create_key_pair(key_name="agent-key"):
 # EC2
 # =====================================================================
 
-def run_ec2_instance(ami_id, instance_type, key_name, subnet_id, sg_id, name="agent-ec2", storage_gb=8):
-    resp = ec2.run_instances(
+# Ready-made bootstrap scripts for common EC2 setups. The agent should
+# call get_user_data_template() to fetch one of these (instead of
+# hand-writing shell script text itself) so bootstrap behavior is
+# consistent and reviewable.
+USER_DATA_TEMPLATES = {
+    "nginx": """#!/bin/bash
+set -e
+sudo apt-get update -y
+sudo apt-get install -y nginx
+sudo systemctl enable nginx
+sudo systemctl start nginx
+""",
+    "docker": """#!/bin/bash
+set -e
+sudo apt-get update -y
+sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt-get update -y
+sudo apt-get install -y docker-ce
+sudo usermod -aG docker ubuntu
+""",
+}
+
+
+def get_user_data_template(preset, docker_image=None, container_port=80, host_port=80, extra_commands=None):
+    """Build a ready-made EC2 user_data bootstrap script.
+
+    preset: 'nginx'      -> installs and starts nginx
+            'docker'      -> installs Docker only
+            'docker_run'  -> installs Docker, then pulls + runs docker_image,
+                              mapping host_port -> container_port
+    extra_commands: optional list of extra shell lines appended at the end
+                    (e.g. ["sudo apt-get install -y git"])
+
+    Returns {"user_data": "<script text>"} -- pass this string straight
+    into run_ec2_instance(..., user_data=...).
+    """
+    if preset == "nginx":
+        script = USER_DATA_TEMPLATES["nginx"]
+    elif preset == "docker":
+        script = USER_DATA_TEMPLATES["docker"]
+    elif preset == "docker_run":
+        if not docker_image:
+            raise ValueError("docker_image is required for the 'docker_run' preset")
+        script = USER_DATA_TEMPLATES["docker"] + (
+            f"\nsudo docker pull {docker_image}\n"
+            f"sudo docker run -d -p {host_port}:{container_port} {docker_image}\n"
+        )
+    else:
+        raise ValueError(f"Unknown preset '{preset}'. Use 'nginx', 'docker', or 'docker_run'.")
+
+    if extra_commands:
+        script += "\n" + "\n".join(extra_commands) + "\n"
+
+    return {"user_data": script}
+
+
+def run_ec2_instance(ami_id, instance_type, key_name, subnet_id, sg_id, name="agent-ec2",
+                      storage_gb=8, user_data=None):
+    """user_data: optional bootstrap script (plain text, boto3 base64-encodes
+    it automatically). Get one via get_user_data_template(), or pass a
+    custom script directly."""
+    kwargs = dict(
         ImageId=ami_id,
         InstanceType=instance_type,
         KeyName=key_name,
@@ -164,8 +227,81 @@ def run_ec2_instance(ami_id, instance_type, key_name, subnet_id, sg_id, name="ag
         }],
         TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": name}]}],
     )
+    if user_data:
+        kwargs["UserData"] = user_data
+    resp = ec2.run_instances(**kwargs)
     instance_id = resp["Instances"][0]["InstanceId"]
     return {"instance_id": instance_id}
+
+
+def check_ec2_instance_health(instance_id):
+    """Checks both AWS system status (underlying host) and instance status
+    (OS-level, requires the instance to be running and status checks to
+    have completed -- usually takes a couple minutes after launch)."""
+    resp = ec2.describe_instance_status(InstanceIds=[instance_id], IncludeAllInstances=True)
+    statuses = resp.get("InstanceStatuses", [])
+    if not statuses:
+        return {"instance_id": instance_id, "status": "NO_STATUS_YET (instance may still be initializing)"}
+    s = statuses[0]
+    return {
+        "instance_id": instance_id,
+        "instance_state": s["InstanceState"]["Name"],
+        "system_status": s["SystemStatus"]["Status"],
+        "instance_status": s["InstanceStatus"]["Status"],
+    }
+
+
+def create_ami_from_instance(instance_id, name, description="agent-created AMI", no_reboot=True):
+    """no_reboot=True (default) creates the image without rebooting the
+    instance first -- faster but slightly less guaranteed filesystem
+    consistency. Set False for a cleaner (but slower) snapshot."""
+    resp = ec2.create_image(InstanceId=instance_id, Name=name, Description=description, NoReboot=no_reboot)
+    return {"image_id": resp["ImageId"], "status": "CREATING (check with check_ami_status)"}
+
+
+def check_ami_status(image_id):
+    resp = ec2.describe_images(ImageIds=[image_id])
+    images = resp.get("Images", [])
+    if not images:
+        return {"image_id": image_id, "status": "NOT_FOUND"}
+    return {"image_id": image_id, "state": images[0]["State"]}
+
+
+def deregister_ami(image_id):
+    ec2.deregister_image(ImageId=image_id)
+    return {"image_id": image_id, "status": "DEREGISTERED"}
+
+
+# =====================================================================
+# EBS
+# =====================================================================
+
+def create_ebs_volume(az, size_gb=8, volume_type="gp3", name="agent-ebs"):
+    resp = ec2.create_volume(
+        AvailabilityZone=az, Size=size_gb, VolumeType=volume_type,
+        TagSpecifications=[{"ResourceType": "volume", "Tags": [{"Key": "Name", "Value": name}]}],
+    )
+    return {"volume_id": resp["VolumeId"], "status": "CREATING"}
+
+
+def attach_ebs_volume(volume_id, instance_id, device="/dev/sdf"):
+    ec2.attach_volume(VolumeId=volume_id, InstanceId=instance_id, Device=device)
+    return {"volume_id": volume_id, "instance_id": instance_id, "device": device, "status": "ATTACHING"}
+
+
+def detach_ebs_volume(volume_id):
+    ec2.detach_volume(VolumeId=volume_id)
+    return {"volume_id": volume_id, "status": "DETACHING"}
+
+
+def delete_ebs_volume(volume_id):
+    ec2.delete_volume(VolumeId=volume_id)
+    return {"volume_id": volume_id, "status": "DELETED"}
+
+
+def create_ebs_snapshot(volume_id, description="agent-created snapshot"):
+    resp = ec2.create_snapshot(VolumeId=volume_id, Description=description)
+    return {"snapshot_id": resp["SnapshotId"], "status": "PENDING"}
 
 
 # =====================================================================
@@ -751,6 +887,148 @@ def create_sagemaker_notebook_instance(name, instance_type, role_arn):
 
 
 # =====================================================================
+# TEARDOWN / DELETE
+# =====================================================================
+# These are destructive and irreversible. The agent is instructed
+# (see SYSTEM_PROMPT) to always show the user exactly what will be
+# deleted and get explicit confirmation before calling any of these.
+
+def terminate_ec2_instance(instance_id):
+    ec2.terminate_instances(InstanceIds=[instance_id])
+    return {"instance_id": instance_id, "status": "TERMINATING"}
+
+
+def delete_security_group(sg_id):
+    ec2.delete_security_group(GroupId=sg_id)
+    return {"sg_id": sg_id, "status": "DELETED"}
+
+
+def delete_internet_gateway(igw_id, vpc_id):
+    ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
+    ec2.delete_internet_gateway(InternetGatewayId=igw_id)
+    return {"igw_id": igw_id, "status": "DELETED"}
+
+
+def delete_route_table(route_table_id):
+    ec2.delete_route_table(RouteTableId=route_table_id)
+    return {"route_table_id": route_table_id, "status": "DELETED"}
+
+
+def delete_subnet(subnet_id):
+    ec2.delete_subnet(SubnetId=subnet_id)
+    return {"subnet_id": subnet_id, "status": "DELETED"}
+
+
+def delete_vpc(vpc_id):
+    """Only succeeds once all dependent resources (subnets, IGW, route
+    tables, non-default security groups) have already been deleted."""
+    ec2.delete_vpc(VpcId=vpc_id)
+    return {"vpc_id": vpc_id, "status": "DELETED"}
+
+
+def delete_key_pair(key_name):
+    ec2.delete_key_pair(KeyName=key_name)
+    return {"key_name": key_name, "status": "DELETED (remember to also rm the local .pem file)"}
+
+
+def delete_s3_bucket(bucket_name, force=False):
+    """force=True empties the bucket first (deletes all objects/versions),
+    otherwise this only succeeds on an already-empty bucket."""
+    if force:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name):
+            objects = page.get("Contents", [])
+            if objects:
+                s3.delete_objects(
+                    Bucket=bucket_name,
+                    Delete={"Objects": [{"Key": o["Key"]} for o in objects]},
+                )
+    s3.delete_bucket(Bucket=bucket_name)
+    return {"bucket": bucket_name, "status": "DELETED"}
+
+
+def delete_ecr_repo(repo_name, force=True):
+    ecr.delete_repository(repositoryName=repo_name, force=force)
+    return {"repo_name": repo_name, "status": "DELETED"}
+
+
+def delete_rds_instance(db_identifier, skip_final_snapshot=True, final_snapshot_id=None):
+    kwargs = dict(DBInstanceIdentifier=db_identifier, SkipFinalSnapshot=skip_final_snapshot)
+    if not skip_final_snapshot:
+        kwargs["FinalDBSnapshotIdentifier"] = final_snapshot_id or f"{db_identifier}-final-snapshot"
+    rds.delete_db_instance(**kwargs)
+    return {"db_identifier": db_identifier, "status": "DELETING (takes several minutes)"}
+
+
+def delete_lambda_function(function_name):
+    lambda_client.delete_function(FunctionName=function_name)
+    return {"function_name": function_name, "status": "DELETED"}
+
+
+def delete_eks_nodegroup(cluster_name, nodegroup_name):
+    eks.delete_nodegroup(clusterName=cluster_name, nodegroupName=nodegroup_name)
+    return {"nodegroup_name": nodegroup_name, "status": "DELETING (nodegroup must finish before deleting the cluster)"}
+
+
+def delete_eks_cluster(cluster_name):
+    eks.delete_cluster(name=cluster_name)
+    return {"cluster_name": cluster_name, "status": "DELETING (all nodegroups must already be deleted)"}
+
+
+def delete_dynamodb_table(table_name):
+    dynamodb.delete_table(TableName=table_name)
+    return {"table_name": table_name, "status": "DELETING"}
+
+
+def delete_sqs_queue(queue_url):
+    sqs.delete_queue(QueueUrl=queue_url)
+    return {"queue_url": queue_url, "status": "DELETED"}
+
+
+def delete_sns_topic(topic_arn):
+    sns.delete_topic(TopicArn=topic_arn)
+    return {"topic_arn": topic_arn, "status": "DELETED"}
+
+
+def delete_load_balancer(lb_arn):
+    elbv2.delete_load_balancer(LoadBalancerArn=lb_arn)
+    return {"lb_arn": lb_arn, "status": "DELETING"}
+
+
+def delete_target_group(tg_arn):
+    elbv2.delete_target_group(TargetGroupArn=tg_arn)
+    return {"tg_arn": tg_arn, "status": "DELETED"}
+
+
+def delete_cloudfront_distribution(distribution_id):
+    """CloudFront requires the distribution to be disabled first and its
+    ETag supplied. This fetches the current config, disables it, and
+    returns instructions -- deletion must be finished with a second call
+    once AWS confirms the distribution has finished deploying as disabled."""
+    resp = cloudfront.get_distribution_config(Id=distribution_id)
+    config = resp["DistributionConfig"]
+    etag = resp["ETag"]
+    if config["Enabled"]:
+        config["Enabled"] = False
+        cloudfront.update_distribution(Id=distribution_id, DistributionConfig=config, IfMatch=etag)
+        return {"distribution_id": distribution_id,
+                "status": "DISABLING (wait for Deployed status, then call delete_cloudfront_distribution again to finish deletion)"}
+    resp2 = cloudfront.get_distribution_config(Id=distribution_id)
+    cloudfront.delete_distribution(Id=distribution_id, IfMatch=resp2["ETag"])
+    return {"distribution_id": distribution_id, "status": "DELETED"}
+
+
+def delete_cloudformation_stack(stack_name):
+    cloudformation.delete_stack(StackName=stack_name)
+    return {"stack_name": stack_name, "status": "DELETING"}
+
+
+def delete_kinesis_stream(stream_name):
+    kinesis.delete_stream(StreamName=stream_name)
+    return {"stream_name": stream_name, "status": "DELETING"}
+
+
+# =====================================================================
 # TOOL REGISTRY
 # =====================================================================
 
@@ -758,7 +1036,14 @@ TOOL_FUNCTIONS = {
     "create_vpc": create_vpc, "create_subnet": create_subnet,
     "create_internet_gateway": create_internet_gateway, "create_route_table": create_route_table,
     "create_security_group": create_security_group, "create_key_pair": create_key_pair,
-    "run_ec2_instance": run_ec2_instance, "create_s3_bucket": create_s3_bucket,
+    "run_ec2_instance": run_ec2_instance, "get_user_data_template": get_user_data_template,
+    "check_ec2_instance_health": check_ec2_instance_health,
+    "create_ami_from_instance": create_ami_from_instance, "check_ami_status": check_ami_status,
+    "deregister_ami": deregister_ami,
+    "create_ebs_volume": create_ebs_volume, "attach_ebs_volume": attach_ebs_volume,
+    "detach_ebs_volume": detach_ebs_volume, "delete_ebs_volume": delete_ebs_volume,
+    "create_ebs_snapshot": create_ebs_snapshot,
+    "create_s3_bucket": create_s3_bucket,
     "create_ecr_repo": create_ecr_repo,
     "create_eks_cluster_role": create_eks_cluster_role, "create_eks_node_role": create_eks_node_role,
     "create_eks_cluster": create_eks_cluster, "create_eks_nodegroup": create_eks_nodegroup,
@@ -789,6 +1074,17 @@ TOOL_FUNCTIONS = {
     "create_kinesis_stream": create_kinesis_stream,
     "invoke_bedrock_model": invoke_bedrock_model, "create_sagemaker_role": create_sagemaker_role,
     "create_sagemaker_notebook_instance": create_sagemaker_notebook_instance,
+    # Teardown / delete
+    "terminate_ec2_instance": terminate_ec2_instance, "delete_security_group": delete_security_group,
+    "delete_internet_gateway": delete_internet_gateway, "delete_route_table": delete_route_table,
+    "delete_subnet": delete_subnet, "delete_vpc": delete_vpc, "delete_key_pair": delete_key_pair,
+    "delete_s3_bucket": delete_s3_bucket, "delete_ecr_repo": delete_ecr_repo,
+    "delete_rds_instance": delete_rds_instance, "delete_lambda_function": delete_lambda_function,
+    "delete_eks_nodegroup": delete_eks_nodegroup, "delete_eks_cluster": delete_eks_cluster,
+    "delete_dynamodb_table": delete_dynamodb_table, "delete_sqs_queue": delete_sqs_queue,
+    "delete_sns_topic": delete_sns_topic, "delete_load_balancer": delete_load_balancer,
+    "delete_target_group": delete_target_group, "delete_cloudfront_distribution": delete_cloudfront_distribution,
+    "delete_cloudformation_stack": delete_cloudformation_stack, "delete_kinesis_stream": delete_kinesis_stream,
 }
 
 TOOLS = [
@@ -804,8 +1100,28 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"vpc_id": {"type": "string"}, "name": {"type": "string"}, "description": {"type": "string"}, "ports": {"type": "array", "items": {"type": "object", "properties": {"port": {"type": "integer"}, "cidr": {"type": "string"}}}}}, "required": ["vpc_id"]}},
     {"name": "create_key_pair", "description": "Create an EC2 key pair, save .pem locally.",
      "input_schema": {"type": "object", "properties": {"key_name": {"type": "string"}}, "required": ["key_name"]}},
-    {"name": "run_ec2_instance", "description": "Launch an EC2 instance.",
-     "input_schema": {"type": "object", "properties": {"ami_id": {"type": "string"}, "instance_type": {"type": "string"}, "key_name": {"type": "string"}, "subnet_id": {"type": "string"}, "sg_id": {"type": "string"}, "name": {"type": "string"}, "storage_gb": {"type": "integer"}}, "required": ["ami_id", "instance_type", "key_name", "subnet_id", "sg_id"]}},
+    {"name": "run_ec2_instance", "description": "Launch an EC2 instance. Optionally pass user_data (a bootstrap shell script) to auto-install software on first boot -- get one from get_user_data_template() or write a custom script.",
+     "input_schema": {"type": "object", "properties": {"ami_id": {"type": "string"}, "instance_type": {"type": "string"}, "key_name": {"type": "string"}, "subnet_id": {"type": "string"}, "sg_id": {"type": "string"}, "name": {"type": "string"}, "storage_gb": {"type": "integer"}, "user_data": {"type": "string", "description": "Plain-text bootstrap shell script, e.g. starting with #!/bin/bash"}}, "required": ["ami_id", "instance_type", "key_name", "subnet_id", "sg_id"]}},
+    {"name": "get_user_data_template", "description": "Build a ready-made EC2 bootstrap script for a common setup (nginx, docker, or docker_run which installs Docker and runs a given image). Returns {'user_data': '<script text>'} to pass into run_ec2_instance.",
+     "input_schema": {"type": "object", "properties": {"preset": {"type": "string", "enum": ["nginx", "docker", "docker_run"]}, "docker_image": {"type": "string", "description": "Required for docker_run, e.g. 'myuser/myimage:latest'"}, "container_port": {"type": "integer"}, "host_port": {"type": "integer"}, "extra_commands": {"type": "array", "items": {"type": "string"}}}, "required": ["preset"]}},
+    {"name": "check_ec2_instance_health", "description": "Check EC2 instance system status and instance status checks (health check).",
+     "input_schema": {"type": "object", "properties": {"instance_id": {"type": "string"}}, "required": ["instance_id"]}},
+    {"name": "create_ami_from_instance", "description": "Create a custom AMI (image) from a running/stopped EC2 instance.",
+     "input_schema": {"type": "object", "properties": {"instance_id": {"type": "string"}, "name": {"type": "string"}, "description": {"type": "string"}, "no_reboot": {"type": "boolean"}}, "required": ["instance_id", "name"]}},
+    {"name": "check_ami_status", "description": "Check whether a custom AMI has finished being created (state: pending/available/failed).",
+     "input_schema": {"type": "object", "properties": {"image_id": {"type": "string"}}, "required": ["image_id"]}},
+    {"name": "deregister_ami", "description": "Deregister (delete) a custom AMI. Destructive.",
+     "input_schema": {"type": "object", "properties": {"image_id": {"type": "string"}}, "required": ["image_id"]}},
+    {"name": "create_ebs_volume", "description": "Create a standalone EBS volume in a given Availability Zone.",
+     "input_schema": {"type": "object", "properties": {"az": {"type": "string"}, "size_gb": {"type": "integer"}, "volume_type": {"type": "string", "enum": ["gp3", "gp2", "io1", "io2", "st1", "sc1"]}, "name": {"type": "string"}}, "required": ["az"]}},
+    {"name": "attach_ebs_volume", "description": "Attach an EBS volume to a running EC2 instance.",
+     "input_schema": {"type": "object", "properties": {"volume_id": {"type": "string"}, "instance_id": {"type": "string"}, "device": {"type": "string"}}, "required": ["volume_id", "instance_id"]}},
+    {"name": "detach_ebs_volume", "description": "Detach an EBS volume from its instance.",
+     "input_schema": {"type": "object", "properties": {"volume_id": {"type": "string"}}, "required": ["volume_id"]}},
+    {"name": "delete_ebs_volume", "description": "Delete an EBS volume. Must be detached first. Destructive.",
+     "input_schema": {"type": "object", "properties": {"volume_id": {"type": "string"}}, "required": ["volume_id"]}},
+    {"name": "create_ebs_snapshot", "description": "Create a point-in-time snapshot of an EBS volume (for backup).",
+     "input_schema": {"type": "object", "properties": {"volume_id": {"type": "string"}, "description": {"type": "string"}}, "required": ["volume_id"]}},
     {"name": "create_s3_bucket", "description": "Create an S3 bucket.",
      "input_schema": {"type": "object", "properties": {"bucket_name": {"type": "string"}}, "required": ["bucket_name"]}},
     {"name": "create_ecr_repo", "description": "Create an ECR repository.",
@@ -910,6 +1226,50 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"role_name": {"type": "string"}}}},
     {"name": "create_sagemaker_notebook_instance", "description": "Create a SageMaker notebook instance.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "instance_type": {"type": "string"}, "role_arn": {"type": "string"}}, "required": ["name", "instance_type", "role_arn"]}},
+
+    # ---- Teardown / delete (destructive -- always confirm with the user first) ----
+    {"name": "terminate_ec2_instance", "description": "Terminate an EC2 instance. Destructive, irreversible.",
+     "input_schema": {"type": "object", "properties": {"instance_id": {"type": "string"}}, "required": ["instance_id"]}},
+    {"name": "delete_security_group", "description": "Delete a security group. Destructive.",
+     "input_schema": {"type": "object", "properties": {"sg_id": {"type": "string"}}, "required": ["sg_id"]}},
+    {"name": "delete_internet_gateway", "description": "Detach and delete an internet gateway. Destructive.",
+     "input_schema": {"type": "object", "properties": {"igw_id": {"type": "string"}, "vpc_id": {"type": "string"}}, "required": ["igw_id", "vpc_id"]}},
+    {"name": "delete_route_table", "description": "Delete a route table. Destructive.",
+     "input_schema": {"type": "object", "properties": {"route_table_id": {"type": "string"}}, "required": ["route_table_id"]}},
+    {"name": "delete_subnet", "description": "Delete a subnet. Destructive.",
+     "input_schema": {"type": "object", "properties": {"subnet_id": {"type": "string"}}, "required": ["subnet_id"]}},
+    {"name": "delete_vpc", "description": "Delete a VPC. Only works once all dependent resources (subnets, IGW, route tables, non-default SGs) are already deleted. Destructive, irreversible.",
+     "input_schema": {"type": "object", "properties": {"vpc_id": {"type": "string"}}, "required": ["vpc_id"]}},
+    {"name": "delete_key_pair", "description": "Delete an EC2 key pair (AWS-side only; local .pem file is not touched).",
+     "input_schema": {"type": "object", "properties": {"key_name": {"type": "string"}}, "required": ["key_name"]}},
+    {"name": "delete_s3_bucket", "description": "Delete an S3 bucket. Set force=true to empty it first (deletes all objects). Destructive, irreversible.",
+     "input_schema": {"type": "object", "properties": {"bucket_name": {"type": "string"}, "force": {"type": "boolean"}}, "required": ["bucket_name"]}},
+    {"name": "delete_ecr_repo", "description": "Delete an ECR repository. force=true (default) also deletes all images in it. Destructive.",
+     "input_schema": {"type": "object", "properties": {"repo_name": {"type": "string"}, "force": {"type": "boolean"}}, "required": ["repo_name"]}},
+    {"name": "delete_rds_instance", "description": "Delete an RDS instance. skip_final_snapshot=true (default) skips taking a backup snapshot. Destructive, irreversible if skip_final_snapshot is true.",
+     "input_schema": {"type": "object", "properties": {"db_identifier": {"type": "string"}, "skip_final_snapshot": {"type": "boolean"}, "final_snapshot_id": {"type": "string"}}, "required": ["db_identifier"]}},
+    {"name": "delete_lambda_function", "description": "Delete a Lambda function. Destructive.",
+     "input_schema": {"type": "object", "properties": {"function_name": {"type": "string"}}, "required": ["function_name"]}},
+    {"name": "delete_eks_nodegroup", "description": "Delete an EKS managed nodegroup. Must finish before deleting the cluster itself.",
+     "input_schema": {"type": "object", "properties": {"cluster_name": {"type": "string"}, "nodegroup_name": {"type": "string"}}, "required": ["cluster_name", "nodegroup_name"]}},
+    {"name": "delete_eks_cluster", "description": "Delete an EKS cluster. All nodegroups must already be deleted first.",
+     "input_schema": {"type": "object", "properties": {"cluster_name": {"type": "string"}}, "required": ["cluster_name"]}},
+    {"name": "delete_dynamodb_table", "description": "Delete a DynamoDB table. Destructive, irreversible.",
+     "input_schema": {"type": "object", "properties": {"table_name": {"type": "string"}}, "required": ["table_name"]}},
+    {"name": "delete_sqs_queue", "description": "Delete an SQS queue. Destructive.",
+     "input_schema": {"type": "object", "properties": {"queue_url": {"type": "string"}}, "required": ["queue_url"]}},
+    {"name": "delete_sns_topic", "description": "Delete an SNS topic. Destructive.",
+     "input_schema": {"type": "object", "properties": {"topic_arn": {"type": "string"}}, "required": ["topic_arn"]}},
+    {"name": "delete_load_balancer", "description": "Delete a load balancer. Destructive.",
+     "input_schema": {"type": "object", "properties": {"lb_arn": {"type": "string"}}, "required": ["lb_arn"]}},
+    {"name": "delete_target_group", "description": "Delete a target group. Destructive.",
+     "input_schema": {"type": "object", "properties": {"tg_arn": {"type": "string"}}, "required": ["tg_arn"]}},
+    {"name": "delete_cloudfront_distribution", "description": "Disable and delete a CloudFront distribution. May need to be called twice: once to disable, once (after it finishes deploying as disabled) to actually delete.",
+     "input_schema": {"type": "object", "properties": {"distribution_id": {"type": "string"}}, "required": ["distribution_id"]}},
+    {"name": "delete_cloudformation_stack", "description": "Delete a CloudFormation stack and all resources it manages. Destructive, irreversible.",
+     "input_schema": {"type": "object", "properties": {"stack_name": {"type": "string"}}, "required": ["stack_name"]}},
+    {"name": "delete_kinesis_stream", "description": "Delete a Kinesis data stream. Destructive.",
+     "input_schema": {"type": "object", "properties": {"stream_name": {"type": "string"}}, "required": ["stream_name"]}},
 ]
 
 
@@ -963,6 +1323,17 @@ NETWORKING (do this first, always needed):
   create_internet_gateway -> create_route_table -> create_security_group
 
 EC2: ...networking... -> create_key_pair -> run_ec2_instance
+  Bootstrap software on first boot: call get_user_data_template(preset=...) to get a
+  ready-made script (presets: 'nginx', 'docker', 'docker_run' with a docker_image),
+  then pass the returned user_data string into run_ec2_instance(..., user_data=...).
+  For anything not covered by a preset, write a plain #!/bin/bash script yourself and
+  pass it as user_data directly -- don't invent a new tool for this, it's just a string.
+  After launch, use check_ec2_instance_health(instance_id) to confirm the instance
+  passed its system/instance status checks (allow 1-2 minutes after launch first).
+  To snapshot a configured instance as a reusable image: create_ami_from_instance ->
+  poll check_ami_status until state is 'available'. Use deregister_ami to remove one.
+  EBS: create_ebs_volume (same AZ as the target instance) -> attach_ebs_volume. Use
+  create_ebs_snapshot for backups, detach_ebs_volume before delete_ebs_volume.
 
 EKS: ...networking (2+ subnets, different AZs)... -> create_eks_cluster_role ->
   create_eks_node_role -> create_eks_cluster -> check_eks_cluster_status (poll until ACTIVE) ->
@@ -989,11 +1360,43 @@ Analytics: Glue/Athena/Kinesis mostly standalone.
 AI/ML: Bedrock is on-demand, no infra. SageMaker needs role first.
 
 Use ids/ARNs returned from earlier tool calls as inputs to later ones. Never fabricate
-resource ids. If a user only wants one type of resource, skip unrelated steps."""
+resource ids. If a user only wants one type of resource, skip unrelated steps.
+
+TEARDOWN / DELETION:
+Delete tools exist for the most common resources (terminate_ec2_instance,
+delete_security_group, delete_internet_gateway, delete_route_table, delete_subnet,
+delete_vpc, delete_key_pair, delete_s3_bucket, delete_ecr_repo, delete_rds_instance,
+delete_lambda_function, delete_eks_nodegroup, delete_eks_cluster, delete_dynamodb_table,
+delete_sqs_queue, delete_sns_topic, delete_load_balancer, delete_target_group,
+delete_cloudfront_distribution, delete_cloudformation_stack, delete_kinesis_stream,
+deregister_ami, delete_ebs_volume, detach_ebs_volume).
+
+These are DESTRUCTIVE and IRREVERSIBLE. Before calling any delete/terminate tool:
+  1. List out exactly which resources will be deleted (with their ids/ARNs).
+  2. Explicitly ask the user to confirm ("yes, delete these" or similar) -- do not
+     proceed on a vague "ok" or "sounds good", require an explicit deletion confirmation.
+  3. If the user asks to tear down a whole environment (e.g. "delete everything we
+     created" or "delete the vpc"), delete resources in dependency order, reverse of
+     how they were created:
+       EC2 instance -> Load balancer/listener/target group -> Security group ->
+       Internet gateway -> Route table -> Subnet -> VPC -> Key pair
+     For RDS/EKS/Lambda-backed setups, delete the dependent compute/data resources
+     (nodegroup before cluster, instance before subnet group, etc.) before networking.
+  4. If a delete call fails because another resource still depends on it (e.g. VPC
+     has remaining subnets), report the exact AWS error to the user and figure out
+     what still needs deleting first -- do not silently retry blindly.
+  5. Never delete something the user did not explicitly ask to delete, even if it
+     looks related."""
 
 
-MODEL_NAME = "gemini-flash-latest"  # auto-updating alias -> currently Gemini 3.5 Flash, free-tier eligible
-# Fallback options if this alias ever misbehaves: "gemini-3-flash" or "gemini-2.5-flash-lite"
+MODEL_NAME = "gemini-2.5-flash-lite"
+# Free-tier daily quotas vary a LOT by model and even by account -- as observed:
+#   gemini-flash-latest (-> gemini-3.5-flash as of writing): as low as 20 requests/DAY on some
+#     accounts -- unusable for a multi-step agent (a single VPC+EC2 plan can burn 15-20 calls)
+#   gemini-2.5-flash-lite: typically ~1000 requests/day, 15-30 RPM -- much better fit here
+# If you still hit daily quota errors, check your project's live limits in AI Studio:
+# https://aistudio.google.com/ -> your project -> Rate limits. Numbers Google publishes in
+# docs are frequently not what a given free-tier project actually gets.
 
 
 def _normalize_gemini_args(value):
@@ -1012,61 +1415,112 @@ def _normalize_gemini_args(value):
     return value
 
 
+class DailyQuotaExhausted(Exception):
+    """Raised when Gemini's free-tier daily (RPD) quota is exhausted --
+    distinct from a per-minute rate limit, because waiting a few seconds
+    won't fix it."""
+    pass
+
+
+def _send_with_retry(chat, content, max_retries=5):
+    """Gemini's free tier enforces both a per-minute limit (RPM) and a
+    per-day limit (RPD). RPM hits are transient -- wait and retry. RPD
+    hits mean the daily allowance for this model is gone; retrying in a
+    loop just wastes time, so we surface that clearly instead."""
+    from google.api_core.exceptions import ResourceExhausted
+
+    for attempt in range(max_retries):
+        try:
+            return chat.send_message(content)
+        except ResourceExhausted as e:
+            err_text = str(e)
+            is_daily = "PerDay" in err_text or "RequestsPerDay" in err_text
+
+            if is_daily:
+                raise DailyQuotaExhausted(
+                    f"Daily free-tier request quota for model '{MODEL_NAME}' is exhausted.\n"
+                    f"This resets at midnight Pacific Time, not in a few seconds -- retrying "
+                    f"won't help right now. Options:\n"
+                    f"  1. Wait for the daily reset (00:00 PT / 08:00 UTC)\n"
+                    f"  2. Switch MODEL_NAME in this script to a model with a higher free-tier "
+                    f"RPD (check current limits at https://aistudio.google.com/ -> your project "
+                    f"-> Rate limits)\n"
+                    f"  3. Enable billing on your Google Cloud project for much higher limits\n"
+                    f"Raw error: {err_text[:300]}"
+                ) from e
+
+            wait_s = 15
+            match = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", err_text)
+            if match:
+                wait_s = int(match.group(1)) + 1
+            print(f"[Rate limited by Gemini free tier (per-minute) -- waiting {wait_s}s before "
+                  f"retry ({attempt + 1}/{max_retries})...]")
+            time.sleep(wait_s)
+    # Last attempt -- let it raise naturally if it still fails
+    return chat.send_message(content)
+
+
 def run_agent():
-    chat = client.chats.create(
-        model=MODEL_NAME,
-        config={
-            "system_instruction": SYSTEM_PROMPT,
-            "tools": GEMINI_TOOLS,
-        },
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=SYSTEM_PROMPT,
+        tools=GEMINI_TOOLS,
     )
+    chat = model.start_chat(history=[])
     print(f"AWS AI Agent (Gemini/{MODEL_NAME}) ready. Type your requirement (or 'quit' to exit).\n")
+    print("Note: free tier has both a per-minute limit (auto-retried below) and a per-day\n"
+          "limit (resets at midnight Pacific Time -- if hit, you'll see a [STOPPED] message).\n")
 
     while True:
         user_input = input("You: ").strip()
         if user_input.lower() in ("quit", "exit"):
             break
 
-        response = chat.send_message(user_input)
+        try:
+            response = _send_with_retry(chat, user_input)
 
-        while True:
-            function_calls = []
-            text_parts = []
+            while True:
+                function_calls = []
+                text_parts = []
 
-            for part in response.content.parts:
-                if hasattr(part, "function_call") and part.function_call and part.function_call.name:
-                    function_calls.append(part.function_call)
-                elif hasattr(part, "text") and part.text:
-                    text_parts.append(part.text)
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "function_call") and part.function_call and part.function_call.name:
+                        function_calls.append(part.function_call)
+                    elif hasattr(part, "text") and part.text:
+                        text_parts.append(part.text)
 
-            if text_parts:
-                print(f"\nAgent: {''.join(text_parts)}\n")
+                if text_parts:
+                    print(f"\nAgent: {''.join(text_parts)}\n")
 
-            if not function_calls:
-                break
+                if not function_calls:
+                    break
 
-            function_response_parts = []
-            for fc in function_calls:
-                fn_name = fc.name
-                fn_args = _normalize_gemini_args(dict(fc.args)) if fc.args else {}
-                fn = TOOL_FUNCTIONS[fn_name]
-                print(f"[Executing] {fn_name}({fn_args})")
-                try:
-                    result = fn(**fn_args)
-                except Exception as e:
-                    result = {"error": str(e)}
-                print(f"[Result] {result}\n")
+                function_response_parts = []
+                for fc in function_calls:
+                    fn_name = fc.name
+                    fn_args = _normalize_gemini_args(dict(fc.args)) if fc.args else {}
+                    fn = TOOL_FUNCTIONS[fn_name]
+                    print(f"[Executing] {fn_name}({fn_args})")
+                    try:
+                        result = fn(**fn_args)
+                    except Exception as e:
+                        result = {"error": str(e)}
+                    print(f"[Result] {result}\n")
 
-                function_response_parts.append(
-                    {
-                        "function_response": {
-                            "name": fn_name,
-                            "response": {"result": json.dumps(result)},
-                        }
-                    }
-                )
+                    function_response_parts.append(
+                        genai.protos.Part(
+                            function_response=genai.protos.FunctionResponse(
+                                name=fn_name,
+                                response={"result": json.dumps(result)},
+                            )
+                        )
+                    )
 
-            response = chat.send_message(function_response_parts)
+                response = _send_with_retry(chat, function_response_parts)
+
+        except DailyQuotaExhausted as e:
+            print(f"\n[STOPPED] {e}\n")
+            print("Type 'quit' to exit, or try again later / after editing MODEL_NAME.\n")
 
 
 if __name__ == "__main__":
